@@ -2,6 +2,8 @@
 
 Pull, merge, and summarize public developer identities from GitHub, Stack Overflow, dev.to, and Hacker News — into a single canonical profile, stored in Supabase, exposed via FastAPI.
 
+Render Link:  https://dev-profile-unifier.onrender.com
+
 ---
 
 This is a FastAPI service that aggregates public profile data from four developer platforms, performs entity resolution to determine if multiple accounts belong to the same person, and enriches the canonical profile with an LLM-generated summary.
