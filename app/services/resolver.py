@@ -24,15 +24,6 @@ from ingestion.pipeline import run_pipeline
 from ingestion.providers import is_stale, has_new_evidence
 
 
-# W_HANDLE_EXACT   = 0.55
-# W_NAME_EXACT     = 0.25
-# W_NAME_FUZZY     = 0.12
-# W_LOCATION_MATCH = 0.10
-# W_EMAIL_MATCH    = 0.30
-# W_LINK_BACK      = 0.20
-# W_HINT_PROVIDED  = 0.15
-
-
 # Confidence scoring weights (sum to 1.0)
 # These signals combine to produce 0.0–1.0 confidence that a provider account
 # belongs to the searched person.
@@ -187,22 +178,35 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
                     print(f"[resolver] skipped attribute insert for {person_id}/{r.source}: {exc}")
 
         # Enrich with LLM (separate error handling)
+        # run_id ties every log line for this enrichment attempt together,
+        # so the terminal output can always be matched back to one run —
+        # even if two resolutions for the same person overlap in time.
+        # (Logging-only: no new DB column required.)
+        run_id = f"{person_id[:8]}-{int(time.monotonic() * 1000) % 1_000_000}"
         await update_enrichment_status(person_id, "LLM_RUNNING")
         try:
-            print(f"[enricher] calling generate_summary, canonical keys: {list(canonical.keys())}")
-            print(f"[enricher] OPENROUTER_API_KEY set: {bool(os.environ.get('OPENROUTER_API_KEY'))}")
+            print(f"[enricher][{run_id}] calling generate_summary, canonical keys: {list(canonical.keys())}")
+            print(f"[enricher][{run_id}] OPENROUTER_API_KEY set: {bool(os.environ.get('OPENROUTER_API_KEY'))}")
             summary, usage = await generate_summary(canonical, raw)
-            print(f"[enricher] summary result: {summary[:80] if summary else 'EMPTY'}")
-            await update_person(person_id, {"llm_summary": summary})
+            print(f"[enricher][{run_id}] summary result: {summary[:80] if summary else 'EMPTY'}")
+
+            # Single atomic write: llm_summary and enrichment_status land
+            # together. No window where a reader sees enrichment_status
+            # READY with the previous run's summary, or the new summary
+            # with a stale status.
+            await update_person(person_id, {
+                "llm_summary": summary,
+                "enrichment_status": "READY",
+            })
             await log_llm_usage(
                 person_id,
                 usage["prompt_tokens"],
                 usage["output_tokens"],
                 usage["model"],
             )
-            await update_enrichment_status(person_id, "READY")
+            print(f"[enricher][{run_id}] persisted to DB, enrichment_status=READY")
         except Exception as exc:
-            print(f"[enricher] failed for {person_id}: {exc}")
+            print(f"[enricher][{run_id}] failed for {person_id}: {exc}")
             await update_enrichment_status(person_id, "FAILED")
             # Don't fail the whole resolution — enrichment is optional
 
@@ -228,7 +232,14 @@ def _extract_handles(req: ResolveRequest) -> dict[str, str | None]:
 
 def _enrichment_incomplete(profile) -> bool:
     status = getattr(profile, "enrichment_status", None)
-    if status == "READY":
+    # READY: enrichment already finished successfully — nothing to do.
+    # LLM_RUNNING: enrichment is in flight right now in another task — treat
+    # as "not incomplete" so a concurrent request doesn't queue a second
+    # _run_resolution (and therefore a second generate_summary call) while
+    # the first one is still working. Without this, two requests arriving
+    # close together both see RESOLVED + a non-READY enrichment_status and
+    # both schedule background enrichment, doubling the LLM spend.
+    if status in ("READY", "LLM_RUNNING"):
         return False
 
     completeness = getattr(profile, "completeness_score", None)
@@ -298,7 +309,6 @@ def _score(req: ResolveRequest, source: str, data: dict, handle: str) -> tuple[f
 def _check_link_back(source: str, data: dict, req: ResolveRequest) -> tuple[float, dict]:
     if source == "devto":
         gh_url = data.get("github_url") or ""
-        # if req.github and req.github.lower() in gh_url.lower():
         if req.github and gh_url:
             # Extract username from github.com/{username}
             match = re.search(r"github\.com/([a-z0-9-]+)", gh_url.lower())

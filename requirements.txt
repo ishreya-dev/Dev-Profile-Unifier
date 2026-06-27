@@ -1,13 +1,24 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-httpx==0.27.0
-pydantic==2.9.2
-pydantic-settings==2.4.0
-supabase==2.9.0
-python-dotenv==1.0.1
-tenacity==8.3.0
-pytest==8.2.0
-pytest-asyncio==0.23.6
-respx==0.21.0
-google-generativeai==0.3.0
-slowapi==0.1.9
+services:
+  - type: web
+    name: dev-profile-unifier
+    env: python
+    pythonVersion: "3.12.0"
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: STACK_EXCHANGE_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: PROFILE_TTL_HOURS
+        value: "24"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: APP_ENV
+        value: production
