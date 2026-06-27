@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import re
 import urllib.parse
 import time
@@ -152,9 +153,10 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
                 "conflicts": conflicts,
                 "completeness_score": completeness,
                 "latest_query": req.model_dump(exclude_none=True),
+                # Always write last_resolved_at so health endpoint resolved/ambiguous
+                # counters stay accurate regardless of final status.
+                "last_resolved_at": datetime.now(timezone.utc).isoformat(),
             }
-            if status == "RESOLVED":
-                update_fields["last_resolved_at"] = datetime.now(timezone.utc).isoformat()
 
             await update_person(person_id, update_fields)
         except Exception as exc:
@@ -187,7 +189,10 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
         # Enrich with LLM (separate error handling)
         await update_enrichment_status(person_id, "LLM_RUNNING")
         try:
+            print(f"[enricher] calling generate_summary, canonical keys: {list(canonical.keys())}")
+            print(f"[enricher] OPENROUTER_API_KEY set: {bool(os.environ.get('OPENROUTER_API_KEY'))}")
             summary, usage = await generate_summary(canonical, raw)
+            print(f"[enricher] summary result: {summary[:80] if summary else 'EMPTY'}")
             await update_person(person_id, {"llm_summary": summary})
             await log_llm_usage(
                 person_id,
@@ -346,22 +351,25 @@ def _emails_match(a: str, b: str) -> bool:
 def _resolution_status(results: list[ResolutionResult]) -> str:
     """
     Determine resolution confidence level.
-    
-    RESOLVED: ≥2 sources with confidence ≥0.50 each
-      → We're confident this is one person across platforms
-    
-    AMBIGUOUS: ≥1 source with 0.40–0.49 confidence
+
+    RESOLVED:
+      - ≥2 sources with confidence ≥0.50 (multi-platform confirmation), OR
+      - 1 source with confidence ≥0.60 (hint + name match — very strong signal)
+
+    AMBIGUOUS: ≥1 source with confidence ≥0.35
       → Some evidence but not enough. User should provide more hints.
-    
-    Returns:
-        "RESOLVED" | "AMBIGUOUS"
+
+    AMBIGUOUS (fallback): anything else
     """
     if not results:
         return "AMBIGUOUS"
     confident = [r for r in results if r.confidence >= 0.50]
     if len(confident) >= 2:
         return "RESOLVED"
-    if any(r.confidence >= 0.40 for r in results):
+    # Single source with hint (0.35) + name (0.25) = 0.60 → strong enough
+    if any(r.confidence >= 0.60 for r in results):
+        return "RESOLVED"
+    if any(r.confidence >= 0.35 for r in results):
         return "AMBIGUOUS"
     return "AMBIGUOUS"
 

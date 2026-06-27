@@ -86,7 +86,7 @@ A canonical profile contains:
 - The system is designed to be idempotent for repeated handle lookups.
 
 ### Enrichment
-- After resolution, the `enricher` generates a summary paragraph using Gemini if `GEMINI_API_KEY` is present.
+- After resolution, the `enricher` generates a summary paragraph using Gemini if `OPENROUTER_API_KEY` is present.
 - If Gemini is unavailable or fails, a fallback summary is built deterministically from the merged profile and provider metadata.
 - Enrichment status is independent from resolution status.
 
@@ -95,7 +95,7 @@ Required or supported variables:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_KEY`
 - `GITHUB_TOKEN`
-- `GEMINI_API_KEY`
+- `OPENROUTER_API_KEY`
 - `STACK_EXCHANGE_KEY`
 - `PROFILE_TTL_HOURS` (optional, defaults to 24)
 - `APP_ENV`, `LOG_LEVEL` (optional runtime settings)

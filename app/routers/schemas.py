@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, field_validator, Field
+from typing import Any
 
 class ResolveRequest(BaseModel):
     name: str = Field(..., description="Full display name to search for")
@@ -11,14 +11,23 @@ class ResolveRequest(BaseModel):
     hackernews: str | None = Field(None, description="Hacker News username")
     email_hint: str | None = Field(None, description="Partial or full email for cross-matching")
 
+    @field_validator("github", "stackoverflow", "devto", "hackernews", "email_hint", mode="before")
+    @classmethod
+    def reject_placeholders(cls, v):
+        if isinstance(v, str) and v.strip().lower() in {
+            "null", "string", "none", "undefined", ""
+        }:
+            return None
+        return v
+    
 
 class SourceContribution(BaseModel):
     source: str
     handle: str
     confidence: float
-    matched_on: list[str] = []
-    explanation: list[str] = []
-    confidence_notes: dict[str, Any] = {}
+    matched_on: list[str] = Field(default_factory=list)
+    explanation: list[str] = Field(default_factory=list)
+    confidence_notes: dict[str, Any] = Field(default_factory=dict)
 
 
 class PersonProfile(BaseModel):
@@ -31,10 +40,10 @@ class PersonProfile(BaseModel):
     resolution_status: str
     enrichment_status: str
     completeness_score: float | None = None
-    provider_statuses: dict[str, str] = {}
+    provider_statuses: dict[str, str] = Field(default_factory=dict)
     sources: list[SourceContribution]
     attributes: dict[str, Any]
-    conflicts: list[dict] = []
+    conflicts: list[dict] = Field(default_factory=list)
     last_resolved_at: str | None = None
     retry_count: int = 0
     last_error: str | None = None

@@ -19,7 +19,7 @@ CREATE TABLE persons (
     location            TEXT,
     bio                 TEXT,
     avatar_url          TEXT,
-    llm_summary         TEXT,               -- Gemini-generated paragraph
+    llm_summary         TEXT,               -- open-router-generated paragraph
     resolution_status   TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING | RESOLVED | AMBIGUOUS | FAILED
     enrichment_status   TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING | LLM_RUNNING | READY | FAILED
     first_query         JSONB,              -- immutable original search context

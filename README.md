@@ -192,7 +192,7 @@ SUPABASE_SERVICE_KEY=your-service-role-key
 GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Optional
-GEMINI_API_KEY=AIza...
+OPENROUTER_API_KEY=AIza...
 STACK_EXCHANGE_KEY=your-stack-exchange-key
 PROFILE_TTL_HOURS=24
 APP_ENV=development
@@ -327,7 +327,7 @@ GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz
 # ========== OPTIONAL ==========
 
 # LLM Enrichment (if missing, falls back to deterministic summary)
-GEMINI_API_KEY=AIzaSyDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENROUTER_API_KEY=AIzaSyDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Stack Exchange / Stack Overflow
 STACK_EXCHANGE_KEY=your-app-key
