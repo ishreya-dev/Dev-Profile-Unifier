@@ -154,6 +154,44 @@ async def test_resolve_ambiguous_with_new_evidence():
     mock_bg.add_task.assert_called_once()
 
 
+# @pytest.mark.asyncio
+# async def test_generate_summary_returns_fallback_when_llm_text_is_null():
+#     class DummyResponse:
+#         def raise_for_status(self):
+#             return None
+
+#         def json(self):
+#             return {
+#                 "candidates": [{"content": {"parts": [{"text": None}]}}],
+#                 "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 0},
+#             }
+
+#     with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}), \
+#          patch("httpx.AsyncClient") as mock_client:
+#         mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=DummyResponse())
+#         summary, usage = await generate_summary(
+#             {"display_name": "Jane Doe", "location": "Remote"},
+#             {"github": {"languages": {"Python": 3}}},
+#         )
+
+#     assert summary is not None
+#     assert "Jane Doe" in summary
+#     assert usage["model"] == "gemini-2.0-flash"
+
+
+# @pytest.mark.asyncio
+# async def test_generate_summary_uses_fallback_when_api_key_missing():
+#     with patch.dict(os.environ, {}, clear=True):
+#         summary, usage = await generate_summary(
+#             {"display_name": "Jane Doe", "location": "Remote"},
+#             {"github": {"languages": {"Python": 3}}},
+#         )
+
+#     assert summary is not None
+#     assert "Jane Doe" in summary
+#     assert usage["model"] == "gemini-2.0-flash"
+
+
 @pytest.mark.asyncio
 async def test_generate_summary_returns_fallback_when_llm_text_is_null():
     class DummyResponse:
@@ -162,11 +200,12 @@ async def test_generate_summary_returns_fallback_when_llm_text_is_null():
 
         def json(self):
             return {
-                "candidates": [{"content": {"parts": [{"text": None}]}}],
-                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 0},
+                "choices": [{"message": {"content": None, "reasoning": None}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0},
+                "model": "openrouter/free",
             }
 
-    with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), \
+    with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}), \
          patch("httpx.AsyncClient") as mock_client:
         mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=DummyResponse())
         summary, usage = await generate_summary(
@@ -176,7 +215,7 @@ async def test_generate_summary_returns_fallback_when_llm_text_is_null():
 
     assert summary is not None
     assert "Jane Doe" in summary
-    assert usage["model"] == "gemini-2.0-flash"
+    assert usage["model"] == "fallback-error"  # falls back when content is null
 
 
 @pytest.mark.asyncio
@@ -189,7 +228,7 @@ async def test_generate_summary_uses_fallback_when_api_key_missing():
 
     assert summary is not None
     assert "Jane Doe" in summary
-    assert usage["model"] == "gemini-2.0-flash"
+    assert usage["model"] == "fallback-no-key"
 
 
 @pytest.mark.asyncio
@@ -205,7 +244,7 @@ async def test_run_resolution_still_enriches_when_source_link_insert_fails():
          patch("app.services.resolver.update_enrichment_status", new_callable=AsyncMock), \
          patch("app.services.resolver.insert_source_link", new_callable=AsyncMock, side_effect=Exception("duplicate key")), \
          patch("app.services.resolver.insert_attributes", new_callable=AsyncMock), \
-         patch("app.services.resolver.generate_summary", new_callable=AsyncMock, return_value=("summary", {"prompt_tokens": 1, "output_tokens": 2, "model": "gemini"})), \
+         patch("app.services.resolver.generate_summary", new_callable=AsyncMock, return_value=("summary", {"prompt_tokens": 1, "output_tokens": 2, "model": "openrouter/free"})), \
          patch("app.services.resolver.log_llm_usage", new_callable=AsyncMock), \
          patch("app.services.resolver.increment_retry", new_callable=AsyncMock) as mock_increment, \
          patch("app.services.resolver.metrics.record_resolution_time"):
