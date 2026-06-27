@@ -1,8 +1,8 @@
 # Dev Profile Unifier
 
-Pull, merge, and summarize public developer identities from GitHub, Stack Overflow, dev.to, and Hacker News.
+Pull, merge, and summarize public developer identities from GitHub, Stack Overflow, dev.to, and Hacker News — into a single canonical profile, stored in Supabase, exposed via FastAPI.
 
-## Overview
+---
 
 This is a FastAPI service that aggregates public profile data from four developer platforms, performs entity resolution to determine if multiple accounts belong to the same person, and enriches the canonical profile with an LLM-generated summary.
 
@@ -222,7 +222,8 @@ The server starts at `http://0.0.0.0:8000`. View docs at `http://localhost:8000/
 
 ---
 
-## API Usage
+**6. Rate Limit Awareness**
+GitHub rate limits are captured from response headers and exposed in `/health`. Providers with circuit breakers (dev.to) fail fast after repeated failures and auto-reset after a cooldown period.
 
 ### Start a Profile Resolution
 
@@ -302,9 +303,10 @@ curl http://localhost:8000/profiles/550e8400-e29b-41d4-a716-446655440000
 
 ### Health Endpoint
 
-```bash
-curl http://localhost:8000/health
-```
+**`person_attributes`** — Source-attributed key/value attributes
+- Stores GitHub languages, Stack Overflow reputation, dev.to article counts, HN karma, etc.
+- Unique index on `(person_id, source, attr_key)` — upsertable, no duplicates
+- **Zero schema migrations needed to add a fifth data source** — new attributes are new rows
 
 Returns uptime, GitHub rate limit, API call statistics, LLM token usage, and profile statistics.
 
@@ -346,8 +348,9 @@ LOG_LEVEL=INFO            # DEBUG, INFO, WARNING, ERROR
 
 Run the test suite:
 
-```bash
-pytest
+-- Observability
+api_call_log: source, endpoint, status_code, latency_ms
+llm_usage_log: person_id, prompt_tokens, output_tokens, model
 ```
 
 Run specific tests:
@@ -468,112 +471,352 @@ MIT (or specify your preferred license)
 
 ### Confidence Scoring
 
-Each provider account is scored 0.0–1.0 based on how confident we are it belongs to the searched person:
+Each provider account is scored 0.0–1.0 based on matching signals:
 
-| Signal | Weight | What it means |
+| Signal | Weight | When It Fires |
 |--------|--------|---------------|
-| User provided exact handle | 0.35 | Caller said `{"name": "Jane", "github": "jdoe"}` |
-| Display name matches exactly | 0.25 | GitHub profile name = "Jane Doe" and request is "Jane Doe" |
-| Email matches email_hint | 0.15 | GitHub commit email = "jane@acme.com" and email_hint = "jane@acme.com" |
-| Account links to other source | 0.05 | dev.to profile lists "GitHub: jdoe" (weak — could be admiration link) |
-| Handle in request (not explicit) | 0.20 | We found "jdoe" but user didn't provide the github field |
+| Handle hint provided | 0.35 | Caller supplied `{"github": "torvalds"}` and we found that handle |
+| Exact name match | 0.25 | Provider display name = request name (case-insensitive) |
+| Email match | 0.15 | Provider email matches `email_hint` |
+| Link-back | 0.05 | Profile explicitly links to another platform (e.g. dev.to → GitHub URL) |
+| Handle only (not hinted) | 0.20 | Handle found but user did not explicitly provide it |
 
-**Scoring logic**: Signals are cumulative. A GitHub account that matches on hint (0.35) + name (0.25) = 0.60 confidence.
+Signals are **cumulative and clamped to 1.0**.
 
-### Resolution Status
+Example: `hint_provided (0.35) + name_exact (0.25) = 0.60 confidence`
 
-A profile reaches each status based on source confidence:
+### Resolution Outcomes
 
-- **RESOLVED**: ≥2 sources score ≥0.50 confidence each
-  - Example: GitHub (0.60) + Stack Overflow (0.55) = RESOLVED
-  - We're confident enough to show this as a unified person
-  
-- **AMBIGUOUS**: Some evidence (≥1 source ≥0.40) but not confident
-  - Example: GitHub (0.45) only = AMBIGUOUS
-  - Could be the person, could be a common name. User may need to provide more hints.
-  
-- **FAILED**: No sources found or all failed to fetch
-  - Check `last_error` for why
-
-### Handling Ambiguity
-
-When a profile is AMBIGUOUS, the API returns it with `resolution_status: "AMBIGUOUS"` and includes all the partial matches the user can inspect:
-
-```bash
-{
-  "profile_id": "550e8400...",
-  "resolution_status": "AMBIGUOUS",
-  "persons": [
-    {
-      "display_name": "Jane Doe",
-      "sources": [
-        { "source": "github", "handle": "jdoe", "confidence": 0.45 },
-        { "source": "dev.to", "handle": "janedoe", "confidence": 0.38 }
-      ]
-    }
-  ]
-}
-```
-
-The client should re-query with more hints (e.g., email_hint, additional handles) to disambiguate.
+| Status | Condition | Meaning |
+|--------|-----------|---------|
+| `RESOLVED` | ≥2 sources ≥ 0.50, OR any single source ≥ 0.60 | Confident enough to show as unified person |
+| `AMBIGUOUS` | ≥1 source ≥ 0.35 | Some evidence, not conclusive — re-query with more hints |
+| `FAILED` | No valid sources returned | All providers failed or name returned no matches |
+| `PENDING` | Resolution in flight | Poll again |
 
 ### Why These Weights?
 
-- **Hint is highest (0.35)**: The user explicitly said "this is their GitHub handle" — strongest signal.
-- **Name is second (0.25)**: Names often collide (Jane Doe is common), but combined with handle, it's convincing.
-- **Email (0.15)**: Email is exposed by some APIs (GitHub commit emails) but not all (Stack Overflow hides it). Moderate weight.
-- **Link-back (0.05)**: A dev.to profile *might* link to the real GitHub, but it could also be a fan linking to an idol. Very weak signal.
-- **Handle only (0.20)**: If we find a handle match but the user didn't suggest it, it's suggestive but not definitive (many people share handles).
+- **Handle hint (0.35)** is highest: the caller explicitly said "this is their account" — strongest possible signal
+- **Name exact (0.25)** is second: names collide frequently but combined with a hint it's convincing
+- **Email (0.15)**: reliable when exposed by the API, but not all platforms expose it
+- **Link-back (0.05)**: a dev.to profile might link to GitHub, but could also be a fan linking to an idol — intentionally weak
+- **No location or fuzzy name**: location is too often stale or wrong; fuzzy name causes too many false positives without confirmation
 
-### Why No Location or Fuzzy Name?
+### Handling Ambiguity
 
-- **Location** is too ambiguous and frequently wrong (people list college towns, work cities, or typos).
-- **Fuzzy name matching** (e.g., "Tom" ≈ "Thomas") causes too many false positives without explicit confirmation.
-
-If you want these signals later, document them and re-weight everything.
+When a profile is `AMBIGUOUS`, the response includes all partial matches with their confidence scores and the signals that fired. The caller can re-query with additional hints (`email_hint`, more handles) to trigger a re-resolution.
 
 ### Edge Cases
 
-1. **Common names** (e.g., "John Smith")
-   - Without email_hint or explicit handles, will be AMBIGUOUS
-   - This is correct — we shouldn't guess
+- **Common names** (e.g., "John Smith") without hints → correctly returns `AMBIGUOUS`
+- **Handle mismatch** (GitHub name is "tj", not "TJ Holowaychuk") → `hint_provided` fires but `name_exact` does not → lower confidence → `AMBIGUOUS`
+- **Platform disagreement** (GitHub: "Portland, OR" vs Stack Overflow: "London, UK") → both stored in `conflicts`, highest-confidence source wins for canonical field
+- **Provider failure** (dev.to down) → resolution continues with available sources, `provider_statuses` records the failure
 
-2. **Platform name differences**
-   - GitHub: "Jane Doe Smith"
-   - Stack Overflow: "Jane D"
-   - Fuzzy matching is disabled to avoid guessing. User should provide email_hint or extra handles.
+---
 
-3. **Stale data**
-   - If a profile was RESOLVED but the person's GitHub profile changed dramatically, re-run resolution with `?refresh=true` to re-fetch.
+## LLM Enrichment
 
-### Testing Your Confidence Scores
+### Why OpenRouter Instead of Gemini
 
-Run a test search for a well-known open-source dev. Example:
+The assessment recommended Gemini free tier. During development, two blockers were encountered:
+
+1. **Wrong key format**: Google AI Studio generates OAuth-style tokens (`AQ.Ab...`) rather than standard API keys (`AIzaSy...`) depending on project configuration
+2. **Zero free quota**: The project's free tier showed `limit: 0` for `generate_content_free_tier_requests`, returning `429 RESOURCE_EXHAUSTED` immediately — resolvable only by adding billing
+
+Per the assessment constraint — *"Do not pay for anything. If you find yourself reaching for a credit card, stop and ask us"* — billing was not added.
+
+**OpenRouter** was chosen as the replacement because:
+- Genuinely free tier, no credit card required
+- OpenAI-compatible API (drop-in replacement, minimal code change)
+- `openrouter/free` model slug auto-selects from available free models — no hardcoded model names that go stale
+- Transparent token usage and cost tracking in response metadata
+- Used model: auto-selected via `openrouter/free` (typically Llama or Mistral variants)
+
+The switch is documented in `enricher.py` and the fallback summary generator ensures the system works even when the LLM is unavailable.
+
+### Summary Generation
+
+The LLM is prompted to write exactly one paragraph (2–3 sentences, under 200 words) based on aggregated platform data. It is explicitly instructed not to invent information not present in the data.
+
+Token usage and estimated cost are tracked per-profile in `llm_usage_log` and surfaced in `/health`.
+
+---
+
+## Observability
+
+The `/health` endpoint returns:
+
+```json
+{
+  "status": "ok",
+  "uptime_seconds": 349,
+  "github_rate_limit": {
+    "remaining": 4968,
+    "limit": 5000,
+    "reset_utc": "2026-06-27T11:26:24+00:00"
+  },
+  "api_calls_by_source": { "github": 8, "stackexchange": 4, "devto": 3 },
+  "api_latency_avg_ms": { "github": 690, "stackexchange": 671, "devto": 733 },
+  "api_failures_by_source": { "devto": 2 },
+  "llm": {
+    "total_tokens": 715,
+    "prompt_tokens": 315,
+    "output_tokens": 400,
+    "calls": 2,
+    "est_cost_usd": 0.000144
+  },
+  "profiles": {
+    "total": 9,
+    "resolved": 6,
+    "ambiguous": 3,
+    "pending": 0,
+    "failed": 0
+  },
+  "enrichment": { "ready": 8, "pending": 0, "failed": 1 },
+  "resolution": { "avg_time_ms": 14272 }
+}
+```
+
+---
+
+## Setup Instructions
+
+### Prerequisites
+
+- Python 3.12+
+- Supabase account (free tier)
+- GitHub Personal Access Token
+- OpenRouter API key (free, no card — sign up at [openrouter.ai](https://openrouter.ai))
+
+### 1. Clone and Create Virtual Environment
+
+```bash
+git clone https://github.com/your-username/Dev-Profile-Unifier.git
+cd Dev-Profile-Unifier
+
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS/Linux
+source venv/bin/activate
+```
+
+### 2. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Set Up Supabase
+
+1. Create a free project at [supabase.com](https://supabase.com)
+2. In the SQL Editor, run `schema/init.sql` to create all tables
+3. Copy your project URL and service role key from **Settings → API**
+
+### 4. Create `.env` File
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```env
+# Required
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Optional — LLM enrichment (fallback summary used if missing)
+OPENROUTER_API_KEY=sk-or-v1-...
+
+# Optional — Stack Exchange (higher rate limits with key)
+STACK_EXCHANGE_KEY=your-stack-exchange-key
+
+# Optional — tuning
+PROFILE_TTL_HOURS=24
+APP_ENV=development
+LOG_LEVEL=INFO
+```
+
+**Getting credentials:**
+- **GitHub token**: [github.com/settings/tokens](https://github.com/settings/tokens) — `public_repo` read scope
+- **OpenRouter key**: [openrouter.ai/keys](https://openrouter.ai/keys) — free, no card
+- **Stack Exchange key**: [stackapps.com/apps/oauth/register](https://stackapps.com/apps/oauth/register)
+
+### 5. Run Locally
+
+```bash
+# Development (auto-reload)
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# Production
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+---
+
+## API Usage
+
+### Resolve a Profile
 
 ```bash
 curl -X POST http://localhost:8000/profiles/resolve \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Linus Torvalds",
-    "github": "torvalds",
-    "email_hint": "torvalds@linux-foundation.org"
+    "name": "Sindre Sorhus",
+    "github": "sindresorhus",
+    "devto": "sindresorhus",
+    "hackernews": "sindresorhus"
   }'
 ```
 
-Expected: All sources score ≥0.50, status = RESOLVED.
+**Response:**
+```json
+{
+  "profile_id": "e607d48a-2421-4a6c-99bf-2277cc6778db",
+  "resolution_status": "PENDING",
+  "enrichment_status": "PENDING",
+  "message": "Resolution started. Poll GET /profiles/{profile_id} for results."
+}
+```
+
+### Get Resolved Profile
 
 ```bash
-curl -X POST http://localhost:8000/profiles/resolve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Jane Smith"
-  }'
+curl http://localhost:8000/profiles/e607d48a-2421-4a6c-99bf-2277cc6778db
 ```
 
-Expected: Multiple sources score 0.25–0.45, status = AMBIGUOUS (ask for email or handles).
+**Response (when resolved):**
+```json
+{
+  "id": "e607d48a-...",
+  "display_name": "Sindre Sorhus",
+  "bio": "Full-Time Open-Sourcerer. Focused on Swift & JavaScript.",
+  "llm_summary": "Sindre Sorhus is a full-time open-sourcerer with 1,100+ public repositories...",
+  "resolution_status": "RESOLVED",
+  "enrichment_status": "READY",
+  "completeness_score": 1.0,
+  "sources": [
+    {
+      "source": "github",
+      "handle": "sindresorhus",
+      "confidence": 0.6,
+      "matched_on": ["hint_provided", "name_exact"]
+    }
+  ],
+  "conflicts": []
+}
+```
 
-## Future Work
+### Health Check
 
+```bash
+curl http://localhost:8000/health
+```
+
+---
+
+## Testing
+
+```bash
+pytest
+
+# Verbose
+pytest tests/ -v
+
+# Specific file
+pytest tests/test_resolver.py -v
+```
+
+---
+
+## Project Structure
+
+```
+Dev-Profile-Unifier/
+├── app/
+│   ├── main.py                    # FastAPI app, middleware, lifespan
+│   ├── routers/
+│   │   ├── profiles.py            # POST /resolve, GET /{id}
+│   │   ├── health.py              # GET /health observability
+│   │   └── schemas.py             # Pydantic models
+│   ├── services/
+│   │   ├── database.py            # Supabase client & queries
+│   │   ├── resolver.py            # Entity resolution + confidence scoring
+│   │   ├── enricher.py            # LLM summary via OpenRouter
+│   │   └── observer.py            # In-memory metrics
+│   └── core/
+│       └── limiter.py             # Rate limiter (slowapi)
+├── ingestion/
+│   ├── base.py                    # BaseFetcher async HTTP client
+│   ├── github.py                  # GitHub provider
+│   ├── stackexchange.py           # Stack Overflow provider
+│   ├── devto.py                   # dev.to provider (with circuit breaker)
+│   ├── hackernews.py              # Hacker News provider
+│   ├── pipeline.py                # Concurrent fetch orchestration
+│   └── providers.py               # Provider registry and staleness logic
+├── schema/
+│   └── init.sql                   # Full PostgreSQL schema
+├── tests/
+│   ├── test_api.py
+│   ├── test_ingestion.py
+│   └── test_resolver.py
+├── requirements.txt
+├── .env.example
+├── README.md
+└── next_week.md                   # Prioritized future improvements
+```
+
+---
+
+## Environment Variables Reference
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SUPABASE_URL` | ✅ | Your Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | ✅ | Supabase service role key (from Settings → API) |
+| `GITHUB_TOKEN` | ✅ | GitHub Personal Access Token (public_repo scope) |
+| `OPENROUTER_API_KEY` | Optional | OpenRouter key for LLM summaries (fallback used if missing) |
+| `STACK_EXCHANGE_KEY` | Optional | Stack Exchange app key (higher rate limits) |
+| `PROFILE_TTL_HOURS` | Optional | Hours before a RESOLVED profile is considered stale (default: 24) |
+| `APP_ENV` | Optional | `development` or `production` |
+| `LOG_LEVEL` | Optional | `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: INFO) |
+
+---
+
+## What I Would Do Differently With More Time
+
+See [`next_week.md`](next_week.md) for full prioritization. In brief:
+
+1. **Redis caching** — in-process metrics are lost on restart; Redis would persist across deploys and share state across multiple instances
+2. **Webhook / SSE** — replace polling with push notifications on resolution completion
+3. **Profile merge endpoint** — if two canonical persons are discovered to be the same, merge their `source_links` and `person_attributes`
+4. **Audit log** — append-only log of every signal, conflict, and provider failure for debugging AMBIGUOUS outcomes
+5. **Rate-limit budgeting** — per-user token buckets to prevent one caller from exhausting the GitHub quota
+6. **Fuzzy name matching with confirmation** — disabled now to avoid false positives, but could be re-enabled with a confidence floor and explicit user confirmation step
+
+---
+
+## Use of AI Tools
+
+Claude (claude.ai) was used throughout this project for:
+- Debugging API integration issues (Gemini quota error, dev.to endpoint correction)
+https://github.com/ishreya-dev/Dev-Profile-Unifier/pull/1/conflict?name=README.md&ancestor_oid=b9f0be992a65bd82f19a381771dbcf1f1927f5b4&base_oid=88d7078c56c9786c32607a1e3a2c7757c7489714&head_oid=aaa74a3cc5955b0a49289dac0aefb170ce9e9135- Code review and bug fixing (orphaned module-level variable, undefined `handle` parameter)
+- README drafting and accuracy checking
+
+All architectural decisions, scoring weights, schema design, and code structure were my own. Claude was used as a pair programmer, not a code generator — every suggestion was reviewed, tested, and adapted.
+
+---
+
+## License
+
+MIT
 Planned improvements are tracked in `next_week.md` and include caching, rate-limit management, webhook notifications, and audit logging.
 
 ## Author
