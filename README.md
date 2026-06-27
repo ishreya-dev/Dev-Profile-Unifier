@@ -237,3 +237,11 @@ Expected: Multiple sources score 0.25–0.45, status = AMBIGUOUS (ask for email 
 ## Future Work
 
 Planned improvements are tracked in `next_week.md` and include caching, rate-limit management, webhook notifications, and audit logging.
+
+## Author
+
+```bash
+Shreya 
+shreya24singhs@gmail.com
+ishreya-dev
+```
