@@ -17,8 +17,8 @@ from app.services.database import (
     insert_source_link,
     insert_attributes,
     log_llm_usage,
-    get_person_by_id,          # ADD THIS — needed for downgrade guard in _run_resolution
-)
+    get_db,
+    )
 from app.services.enricher import generate_summary
 from app.services.observer import metrics
 from ingestion.pipeline import run_pipeline
@@ -105,15 +105,17 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
         }
         new_success_count = sum(1 for v in provider_statuses.values() if v == "SUCCESS")
 
-        # ── Downgrade guard ───────────────────────────────────────────────────
-        # If the profile was already RESOLVED and this re-run fetched *fewer*
-        # successful sources than are already on record (e.g. GitHub failed
-        # transiently during a stale refresh), do NOT overwrite the richer
-        # existing result with a degraded one.  Record the new provider
-        # statuses for observability, then bail out.
-        existing_snapshot = await get_person_by_id(person_id)
-        existing_status = existing_snapshot.get("resolution_status") if existing_snapshot else None
-        existing_source_count = len(existing_snapshot.get("sources") or []) if existing_snapshot else 0
+        # ── Downgrade guard ───────────────────────────────────────────────────────────
+        existing_row = get_db().table("persons").select(
+        "resolution_status, provider_statuses"
+        ).eq("id", person_id).execute()
+
+        existing_data = existing_row.data[0] if existing_row.data else {}
+        existing_status = existing_data.get("resolution_status")
+        existing_source_count = len([
+            v for v in (existing_data.get("provider_statuses") or {}).values()
+            if v == "SUCCESS"
+        ])
 
         if existing_status == "RESOLVED" and new_success_count < existing_source_count:
             print(
@@ -121,13 +123,12 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
                 f"re-run got {new_success_count} source(s) but existing RESOLVED "
                 f"profile has {existing_source_count}. Keeping existing data."
             )
-            # Still persist the provider statuses so /health reflects the
-            # transient failure — but leave all resolution fields untouched.
             await update_person(person_id, {"provider_statuses": provider_statuses})
             return
-        # ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
         await update_person(person_id, {"provider_statuses": provider_statuses})
+
 
         results: list[ResolutionResult] = []
 
@@ -339,11 +340,6 @@ def _emails_match(a: str, b: str) -> bool:
 
 
 def _resolution_status(results: list[ResolutionResult]) -> str:
-    
-    print(f"[resolver] _resolution_status called with {len(results)} results")  # temp
-    hint_provided = [r for r in results if "hint_provided" in r.notes]
-    print(f"[resolver] hint_provided count: {len(hint_provided)}")  # temp
-
     if not results:
         return "AMBIGUOUS"
     confident = [r for r in results if r.confidence >= 0.50]
