@@ -1,62 +1,46 @@
 # Next Week — Prioritized Improvements
 
-## High Priority (Days 1–2)
+## Bugs Fixed This Session
 
-### 1. Structured Logging & Audit Trail (2 hours)
-**Why:** Debugging AMBIGUOUS profiles is blind without seeing which signals fired.
-**Implementation:** JSON log events for:
-- Each provider fetch (success, failure, latency)
-- Each scoring decision (signal name, weight, confidence delta)
-- Each conflict detected (field, values, resolution)
-Store in Supabase `audit_logs` table for retrieval via dashboard.
-**Test:** Mock two conflicting providers, assert audit trail captures both.
-
-### 2. Circuit Breakers (3 hours)
-**Why:** Stack Exchange returns 503 frequently. Currently we burn retries and clutter observability.
-**Implementation:** `aiobreaker` wrapper around each provider. After 3 failures in 60s, fail-fast with cached result or partial profile.
-**Test:** Mock 503 response, verify circuit opens, subsequent calls don't retry.
-
-## Medium Priority (Days 3–4)
-
-### 3. Merge Workflow (6 hours)
-**Why:** User corrects a split decision manually (two persons → one).
-**Implementation:** Admin endpoint POST `/admin/merge_persons` takes person_a, person_b, marks person_b as MERGED_INTO person_a, re-links source_links, dedupes attributes.
-**Hard part:** Deciding which attributes win on conflict (timestamp? user choice?).
-**Test:** Merge two persons, verify source_links follow, GET merged person returns all sources.
-
-### 4. Redis Caching (4 hours)
-**Why:** Multi-instance deployment (if scaling) loses state on restart. Single-instance needs 24h TTL refresh.
-**Cost/Benefit:** Upstash free = $0 for this scope. Time: 2–3 hours. Worth it when >50 concurrent users.
-**Not doing now:** Single Render instance is sufficient.
-
-## Low Priority (Day 5 / Defer)
-
-### 5. Webhook / Push Model (6 hours)
-**Why:** Eliminates polling. Reduces 30s latency for AMBIGUOUS profiles.
-**Blocker:** Requires rate limit budgeting (below) to prevent webhook storms.
-**Defer until:** Webhook infra is stable, rate limiting is in place.
-
-### 6. Rate Limit Budgeting (2 hours)
-**Why:** GitHub 5k/hr is shared. One user doing 20 resolutions starves others.
-**Implementation:** Token bucket per user, reserve quota before enqueuing fetch.
-**Do this before item 5 (webhooks).
+| Bug | File | Fix |
+|-----|------|-----|
+| Re-resolution overwrote RESOLVED profile when a provider failed transiently | `resolver.py` | Downgrade guard: if new run has fewer sources than existing RESOLVED profile, keep existing |
+| `completeness_score` always returned 1.0 regardless of actual field population | `resolver.py` | Fixed check — was `any(r.source in [...])` which is always True; now checks `f in sources_present` |
+| Two hint-provided sources resolved to AMBIGUOUS instead of RESOLVED | `resolver.py` | Added 2-hint rule: if ≥2 sources both have `hint_provided`, return RESOLVED |
+| LLM reasoning leaked into `llm_summary` | `enricher.py` | Reduced `max_tokens` 300→120, added line-level reasoning filter, simplified prompt |
+| Prompt caused reasoning loops when bio/location were null | `enricher.py` | Removed "mention their primary languages and notable work" instruction; now passes top repos by stars so model has concrete data |
 
 ---
 
-## Testing Strategy
+## This Week (High Priority Only)
 
-| Feature | Unit | Integration | Notes |
-|---------|------|-------------|-------|
-| Logging | Mock providers, check log events | Real Supabase | Verify JSON structure |
-| Breaker | Mock 503, check fail-fast | Real rate limit | Verify cache fallback |
-| Merge | Mock person rows | Real DB constraints | Check FK integrity |
-| Redis | Mock cache hits | Real Upstash | Verify TTL, eviction |
-| Webhooks | Mock callback | Real endpoint | Test retry backoff |
+### 1. Fix `_resolution_status` deployment 
+The 2-hint rule fix is in the code but not yet confirmed live on the running server. Restart uvicorn, delete the existing TJ profile, re-resolve, and verify `resolution_status: RESOLVED` comes back.
 
-## Rollout Plan
+### 2. Structured Audit Logging
+**Why:** Right now debugging an AMBIGUOUS profile is blind — no record of which signals fired or why.
 
-1. **Logging + Breakers** (stable features, ship immediately)
-2. **Merge workflow** (admin-only, low risk)
-3. **Pause, measure observability** (see if new features are actually needed)
-4. **Redis + Rate limiting** (only if handling >10 concurrent resolutions)
-5. **Webhooks** (polish, not MVP)
+**What:** Add a JSON log event per resolution run recording:
+- Which signals fired per source (hint, name match, email, link-back)
+- Final confidence per source
+- Resolution status decision and why
+
+Store in existing `api_call_log` pattern or a new `resolution_log` column on `persons`. No new table needed if stored as JSONB.
+
+### 3. LLM Fallback Quality
+**Why:** OpenRouter free tier returns empty responses under load fairly often. The deterministic fallback fires correctly but produces awkward output (trailing space after language list: "JavaScript, Go, Shell, Ruby .").
+
+**What:**
+- Fix the trailing punctuation bug in `_build_fallback_summary` (the `. ` after language list when bio is absent)
+- Add top 2 repos by stars to fallback output so it matches LLM quality when LLM is unavailable
+- Log which path fired (LLM vs fallback) so it's visible in `/health`
+
+### 4. Circuit Breaker for Flaky Providers
+**Why:** dev.to and Stack Exchange return 503 regularly. Currently every failure burns a full retry timeout before moving on, slowing resolution by several seconds.
+
+**What:** Wrap each provider with a simple counter-based circuit breaker. After 3 failures in 60 seconds, skip that provider immediately and mark `provider_statuses[source] = "CIRCUIT_OPEN"`. Auto-reset after 60s cooldown. dev.to already has partial circuit breaker logic — generalise it to all providers.
+
+### 5. `name_exact` Not Firing for GitHub 
+**Why:** GitHub handle `tj` has display name "TJ Holowaychuk" which should match `req.name` exactly and add +0.25, bringing confidence to 0.60 (RESOLVED on single source). Currently not firing — likely the GitHub fetcher returns the name under a different key or with different casing.
+
+**What:** Add a debug print in `_score` to log `api_name` vs `req_name` for GitHub, identify the mismatch, fix the field key in `github.py` or the comparison in `_score`.

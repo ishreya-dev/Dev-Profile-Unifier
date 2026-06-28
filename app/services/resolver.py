@@ -17,6 +17,7 @@ from app.services.database import (
     insert_source_link,
     insert_attributes,
     log_llm_usage,
+    get_person_by_id,          # ADD THIS — needed for downgrade guard in _run_resolution
 )
 from app.services.enricher import generate_summary
 from app.services.observer import metrics
@@ -25,14 +26,11 @@ from ingestion.providers import is_stale, has_new_evidence
 
 
 # Confidence scoring weights (sum to 1.0)
-# These signals combine to produce 0.0–1.0 confidence that a provider account
-# belongs to the searched person.
-W_HINT_PROVIDED   = 0.35  # Caller explicitly provided this handle
-W_HANDLE_EXACT    = 0.20  # Handle matches in request (but not explicitly provided)
-W_NAME_EXACT      = 0.25  # Display name matches request exactly
-W_EMAIL_MATCH     = 0.15  # Email in profile matches email_hint
-W_LINK_BACK       = 0.05  # Profile links to another of our confirmed sources
-# Removed: W_NAME_FUZZY, W_LOCATION_MATCH (too noisy; causes false positives)
+W_HINT_PROVIDED   = 0.35
+W_HANDLE_EXACT    = 0.20
+W_NAME_EXACT      = 0.25
+W_EMAIL_MATCH     = 0.15
+W_LINK_BACK       = 0.05
 
 
 COMPLETENESS_FIELDS = [
@@ -99,31 +97,52 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
         await update_person(person_id, {"last_attempted_at": now})
 
         handles = _extract_handles(req)
-        raw = await run_pipeline(handles) # May return {"github": data, "stackoverflow": {"error": "..."}}
+        raw = await run_pipeline(handles)
 
         provider_statuses = {
             source: "FAILED" if "error" in data else "SUCCESS"
             for source, data in raw.items()
         }
+        new_success_count = sum(1 for v in provider_statuses.values() if v == "SUCCESS")
+
+        # ── Downgrade guard ───────────────────────────────────────────────────
+        # If the profile was already RESOLVED and this re-run fetched *fewer*
+        # successful sources than are already on record (e.g. GitHub failed
+        # transiently during a stale refresh), do NOT overwrite the richer
+        # existing result with a degraded one.  Record the new provider
+        # statuses for observability, then bail out.
+        existing_snapshot = await get_person_by_id(person_id)
+        existing_status = existing_snapshot.get("resolution_status") if existing_snapshot else None
+        existing_source_count = len(existing_snapshot.get("sources") or []) if existing_snapshot else 0
+
+        if existing_status == "RESOLVED" and new_success_count < existing_source_count:
+            print(
+                f"[resolver] Skipping overwrite for {person_id}: "
+                f"re-run got {new_success_count} source(s) but existing RESOLVED "
+                f"profile has {existing_source_count}. Keeping existing data."
+            )
+            # Still persist the provider statuses so /health reflects the
+            # transient failure — but leave all resolution fields untouched.
+            await update_person(person_id, {"provider_statuses": provider_statuses})
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
         await update_person(person_id, {"provider_statuses": provider_statuses})
 
         results: list[ResolutionResult] = []
 
-        # Score each successful provider (skip failures gracefully)
         for source, data in raw.items():
             if "error" in data:
                 print(f"[resolver] Skipping {source}: {data['error']}")
                 continue
-
             try:
                 handle = handles.get(source) or data.get("handle", "")
                 conf, notes = _score(req, source, data, handle)
                 results.append(ResolutionResult(source, handle, conf, notes))
             except Exception as exc:
                 print(f"[resolver] Error scoring {source}: {exc}")
-                # Don't add to results, but continue with next provider
-                continue 
-        # If NO successful sources, mark as FAILED
+                continue
+
         if not results:
             await update_person(person_id, {
                 "resolution_status": "FAILED",
@@ -132,7 +151,6 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
             })
             return
 
-        # Merge and persist results
         try:
             canonical, conflicts = _merge_canonical(req, results, raw)
             completeness = _completeness_score(canonical, results)
@@ -144,8 +162,6 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
                 "conflicts": conflicts,
                 "completeness_score": completeness,
                 "latest_query": req.model_dump(exclude_none=True),
-                # Always write last_resolved_at so health endpoint resolved/ambiguous
-                # counters stay accurate regardless of final status.
                 "last_resolved_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -159,7 +175,6 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
             })
             return
 
-        # Link sources and extract attributes
         for r in results:
             raw_id = raw[r.source].get("_raw_source_id")
             if raw_id:
@@ -177,11 +192,6 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
                 except Exception as exc:
                     print(f"[resolver] skipped attribute insert for {person_id}/{r.source}: {exc}")
 
-        # Enrich with LLM (separate error handling)
-        # run_id ties every log line for this enrichment attempt together,
-        # so the terminal output can always be matched back to one run —
-        # even if two resolutions for the same person overlap in time.
-        # (Logging-only: no new DB column required.)
         run_id = f"{person_id[:8]}-{int(time.monotonic() * 1000) % 1_000_000}"
         await update_enrichment_status(person_id, "LLM_RUNNING")
         try:
@@ -190,10 +200,6 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
             summary, usage = await generate_summary(canonical, raw)
             print(f"[enricher][{run_id}] summary result: {summary[:80] if summary else 'EMPTY'}")
 
-            # Single atomic write: llm_summary and enrichment_status land
-            # together. No window where a reader sees enrichment_status
-            # READY with the previous run's summary, or the new summary
-            # with a stale status.
             await update_person(person_id, {
                 "llm_summary": summary,
                 "enrichment_status": "READY",
@@ -208,15 +214,12 @@ async def _run_resolution(person_id: str, req: ResolveRequest) -> None:
         except Exception as exc:
             print(f"[enricher][{run_id}] failed for {person_id}: {exc}")
             await update_enrichment_status(person_id, "FAILED")
-            # Don't fail the whole resolution — enrichment is optional
 
-        # Record timing
         elapsed_ms = int((time.monotonic() - start) * 1000)
         await update_person(person_id, {"last_resolution_ms": elapsed_ms})
         metrics.record_resolution_time(elapsed_ms)
 
     except Exception as exc:
-        # Catch-all for truly unexpected errors
         print(f"[resolver] failed for {person_id}: {exc}")
         await increment_retry(person_id, str(exc))
 
@@ -232,20 +235,11 @@ def _extract_handles(req: ResolveRequest) -> dict[str, str | None]:
 
 def _enrichment_incomplete(profile) -> bool:
     status = getattr(profile, "enrichment_status", None)
-    # READY: enrichment already finished successfully — nothing to do.
-    # LLM_RUNNING: enrichment is in flight right now in another task — treat
-    # as "not incomplete" so a concurrent request doesn't queue a second
-    # _run_resolution (and therefore a second generate_summary call) while
-    # the first one is still working. Without this, two requests arriving
-    # close together both see RESOLVED + a non-READY enrichment_status and
-    # both schedule background enrichment, doubling the LLM spend.
     if status in ("READY", "LLM_RUNNING"):
         return False
-
     completeness = getattr(profile, "completeness_score", None)
     if completeness is not None:
         return completeness < 1.0
-
     for field in ("bio", "location", "avatar_url", "llm_summary"):
         value = getattr(profile, field, None)
         if value in (None, ""):
@@ -254,19 +248,6 @@ def _enrichment_incomplete(profile) -> bool:
 
 
 def _score(req: ResolveRequest, source: str, data: dict, handle: str) -> tuple[float, dict]:
-    """
-    Score a provider account's likelihood of belonging to the searched person.
-    
-    Returns:
-        (confidence: 0.0–1.0, notes: dict of signals that fired)
-    
-    Signals:
-        - Hint provided: User explicitly said this handle (0.35)
-        - Name exact: Display name matches exactly (0.25)
-        - Email match: Email matches email_hint (0.15)
-        - Link back: Account links to another source (0.05)
-        - Handle only: Handle matches but not explicitly hinted (0.20)
-    """
     score = 0.0
     notes: dict = {}
 
@@ -310,15 +291,14 @@ def _check_link_back(source: str, data: dict, req: ResolveRequest) -> tuple[floa
     if source == "devto":
         gh_url = data.get("github_url") or ""
         if req.github and gh_url:
-            # Extract username from github.com/{username}
             match = re.search(r"github\.com/([a-z0-9-]+)", gh_url.lower())
             if match and match.group(1) == req.github.lower():
                 return W_LINK_BACK, {
                     "devto_links_github": {
-                    "weight": W_LINK_BACK,
-                    "explanation": f"+{W_LINK_BACK} dev.to profile links back to github.com/{req.github}",
-                },
-            }
+                        "weight": W_LINK_BACK,
+                        "explanation": f"+{W_LINK_BACK} dev.to profile links back to github.com/{req.github}",
+                    },
+                }
 
     if source == "github":
         blog = (data.get("blog") or "").lower()
@@ -359,25 +339,21 @@ def _emails_match(a: str, b: str) -> bool:
 
 
 def _resolution_status(results: list[ResolutionResult]) -> str:
-    """
-    Determine resolution confidence level.
+    
+    print(f"[resolver] _resolution_status called with {len(results)} results")  # temp
+    hint_provided = [r for r in results if "hint_provided" in r.notes]
+    print(f"[resolver] hint_provided count: {len(hint_provided)}")  # temp
 
-    RESOLVED:
-      - ≥2 sources with confidence ≥0.50 (multi-platform confirmation), OR
-      - 1 source with confidence ≥0.60 (hint + name match — very strong signal)
-
-    AMBIGUOUS: ≥1 source with confidence ≥0.35
-      → Some evidence but not enough. User should provide more hints.
-
-    AMBIGUOUS (fallback): anything else
-    """
     if not results:
         return "AMBIGUOUS"
     confident = [r for r in results if r.confidence >= 0.50]
     if len(confident) >= 2:
         return "RESOLVED"
-    # Single source with hint (0.35) + name (0.25) = 0.60 → strong enough
     if any(r.confidence >= 0.60 for r in results):
+        return "RESOLVED"
+    # ADD THIS: 2+ explicit hints = caller confirmed both handles directly
+    hint_provided = [r for r in results if "hint_provided" in r.notes]
+    if len(hint_provided) >= 2:
         return "RESOLVED"
     if any(r.confidence >= 0.35 for r in results):
         return "AMBIGUOUS"
@@ -414,9 +390,16 @@ def _merge_canonical(
 
 
 def _completeness_score(canonical: dict, results: list[ResolutionResult]) -> float:
+    # FIX: was checking `any(r.source in [...])` which is always True when any
+    # result exists — making completeness_score always return 1.0 regardless of
+    # whether canonical fields (bio, location, etc.) were actually populated.
+    # Now correctly checks whether the field is actually present in canonical,
+    # or whether the source platform was successfully reached (platform presence
+    # means those platform-specific COMPLETENESS_FIELDS are counted as filled).
+    sources_present = {r.source for r in results}
     filled = sum(
         1 for f in COMPLETENESS_FIELDS
-        if canonical.get(f) or any(r.source in ["github", "stackexchange", "devto", "hackernews"] for r in results)
+        if canonical.get(f) or f in sources_present
     )
     return min(1.0, filled / len(COMPLETENESS_FIELDS))
 

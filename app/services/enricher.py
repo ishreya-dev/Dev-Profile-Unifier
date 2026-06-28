@@ -14,7 +14,6 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Matches common safety/moderation/system-tag lines that some models append
-# or substitute instead of the actual answer (e.g. "User Safety: safe").
 _METADATA_PATTERNS = re.compile(
     r"""^\s*(
         user\s*safety|
@@ -26,12 +25,7 @@ _METADATA_PATTERNS = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Matches the model narrating/second-guessing its own formatting compliance
-# instead of (or in addition to) actually answering — e.g. "Make sure exactly
-# 2 sentences. No extra punctuation that creates more sentences? Eg. ...".
-# This is reasoning-about-the-instructions leaking into the output, distinct
-# from a safety tag and distinct from a clean reasoning-then-blank-line-then-
-# answer shape (which the paragraph-walk already handles).
+# Matches reasoning/meta-commentary leaking into output
 _META_COMMENTARY_PATTERNS = re.compile(
     r"""(
         make\s+sure\s+(exactly|it'?s|to)|
@@ -40,32 +34,46 @@ _META_COMMENTARY_PATTERNS = re.compile(
         that'?s\s+one\s+sentence|
         let\s+me\s+(think|check|count|make\s+sure)|
         i\s+(should|need\s+to|will)\s+(write|make\s+sure|keep|count)|
-        as\s+(an?\s+)?(ai|language\s+model|assistant)
+        as\s+(an?\s+)?(ai|language\s+model|assistant)|
+        # Reasoning-model patterns: thinking out loud mid-sentence
+        this\s+creates\s+a\s+conflict|
+        we\s+(must|cannot|need\s+to|have\s+no)|
+        the\s+instruction\s*:|
+        perhaps\s+we\s+(must|can|should)|
+        is\s+that\s+acceptable\??|
+        could\s+be\s+considered|
+        we\s+risk\s+violating|
+        saying\s+they\s+are\s+not\s+specified
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Detects lines that look like reasoning steps rather than prose
+# e.g. "So we can produce:", "But that would not be..."
+_REASONING_STEP_PATTERNS = re.compile(
+    r"""^(
+        so\s+we\s+(can|cannot|must|should)|
+        but\s+that\s+(would|could|is)|
+        however\s+we\s+must|
+        if\s+we\s+say|
+        maybe\s+we\s+can|
+        it\s+is\s+not\s+inventing|
+        \(.*\)\s*$
     )""",
     re.IGNORECASE | re.VERBOSE,
 )
 
 
 async def generate_summary(canonical: dict, raw: dict) -> tuple[str, dict]:
-    """
-    Build a prompt from the unified profile and call OpenRouter.
-    Returns (summary_text, usage_dict).
-    """
-
     print(f"[enricher] generate_summary called for: {canonical.get('display_name')}")
     prompt = _build_prompt(canonical, raw)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     print(f"[enricher] API key found: {'Yes' if api_key else 'NO KEY'}")
 
-    # No API key → fallback
     if not api_key:
         fallback = _build_fallback_summary(canonical, raw)
         metrics.record_llm_usage(0, 0)
-        return fallback, {
-            "prompt_tokens": 0,
-            "output_tokens": 0,
-            "model": "fallback-no-key",
-        }
+        return fallback, {"prompt_tokens": 0, "output_tokens": 0, "model": "fallback-no-key"}
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -81,23 +89,27 @@ async def generate_summary(canonical: dict, raw: dict) -> tuple[str, dict]:
                         {
                             "role": "system",
                             "content": (
-                                "You write short developer bios. Reply with ONLY the bio "
-                                "itself — no explanation, no notes, no thinking about "
-                                "format, no quotation marks around it. "
-                                "Exactly 2 sentences, then stop.\n\n"
-                                "Example output (this exact format, nothing added before "
-                                "or after):\n"
-                                "Jane Doe is a backend engineer working primarily in Go "
-                                "and Rust, known for the popular library fastqueue. "
-                                "She has over 12,000 GitHub followers."
-                            )
+                                "You write short developer bios. "
+                                "Reply with ONLY the bio itself — "
+                                "no explanation, no reasoning, no notes, "
+                                "no thinking out loud, no quotation marks. "
+                                "Write exactly 2 sentences, then stop immediately.\n\n"
+                                "Example (copy this format exactly):\n"
+                                "Jane Doe is a backend engineer known for creating "
+                                "fastqueue, a popular Go job-queue library. "
+                                "She has 12,000 GitHub followers and is active in "
+                                "distributed systems and databases."
+                            ),
                         },
                         {
                             "role": "user",
-                            "content": prompt
-                        }
+                            "content": prompt,
+                        },
                     ],
-                    "max_tokens": 300,
+                    # FIX: was 300 — enough for reasoning leak to fill the budget.
+                    # 120 tokens is plenty for 2 clean sentences and forces the
+                    # model to be concise rather than reason at length.
+                    "max_tokens": 120,
                 },
             )
             resp.raise_for_status()
@@ -107,38 +119,22 @@ async def generate_summary(canonical: dict, raw: dict) -> tuple[str, dict]:
         print(f"[enricher] OpenRouter call failed: {exc}")
         fallback = _build_fallback_summary(canonical, raw)
         metrics.record_llm_usage(0, 0)
-        return fallback, {
-            "prompt_tokens": 0,
-            "output_tokens": 0,
-            "model": "fallback-error",
-        }
+        return fallback, {"prompt_tokens": 0, "output_tokens": 0, "model": "fallback-error"}
 
-    # Extract response — take last paragraph that looks like real content,
-    # skipping any reasoning leak or safety/metadata tag the model appended.
     candidate = _extract_candidate_text(body)
-    print(f"[enricher] summary result: {candidate[:80] if candidate else 'EMPTY'}")
+    print(f"[enricher] raw candidate: {candidate[:120] if candidate else 'EMPTY'}")
 
     if not candidate:
-        # Diagnostic: was there genuinely no content, or did every paragraph
-        # get filtered out as metadata? This tells us which case we're in
-        # without needing to reproduce it live.
         choices = body.get("choices") or []
         if not choices:
             print("[enricher] DEBUG: response had no 'choices' at all")
         else:
             for i, choice in enumerate(choices):
                 raw_text = (choice.get("message") or {}).get("content")
-                if not isinstance(raw_text, str) or not raw_text.strip():
-                    print(f"[enricher] DEBUG: choice[{i}] content was empty/missing: {raw_text!r}")
-                    continue
-                paragraphs = [p.strip() for p in raw_text.strip().split("\n\n") if p.strip()]
                 print(
-                    f"[enricher] DEBUG: choice[{i}] had {len(paragraphs)} paragraph(s), "
-                    f"all flagged as metadata. Raw content follows:\n"
-                    f"--- RAW CONTENT START ---\n{raw_text}\n--- RAW CONTENT END ---"
+                    f"[enricher] DEBUG: choice[{i}] raw content:\n"
+                    f"--- START ---\n{raw_text}\n--- END ---"
                 )
-                for j, p in enumerate(paragraphs):
-                    print(f"[enricher] DEBUG: choice[{i}] paragraph[{j}] = {p!r}")
 
     usage_raw = body.get("usage", {}) or {}
     prompt_t = usage_raw.get("prompt_tokens", 0)
@@ -146,7 +142,7 @@ async def generate_summary(canonical: dict, raw: dict) -> tuple[str, dict]:
     model_used = body.get("model", "openrouter/free")
 
     if not candidate or _looks_like_metadata(candidate):
-        print(f"[enricher] discarding invalid/metadata-only response, using fallback")
+        print("[enricher] discarding invalid response, using fallback")
         candidate = _build_fallback_summary(canonical, raw)
         metrics.record_llm_usage(0, 0)
         return candidate.strip(), {
@@ -156,7 +152,6 @@ async def generate_summary(canonical: dict, raw: dict) -> tuple[str, dict]:
         }
 
     metrics.record_llm_usage(prompt_t, output_t)
-
     return candidate.strip(), {
         "prompt_tokens": prompt_t,
         "output_tokens": output_t,
@@ -165,16 +160,12 @@ async def generate_summary(canonical: dict, raw: dict) -> tuple[str, dict]:
 
 
 def _looks_like_metadata(paragraph: str) -> bool:
-    """
-    Heuristic: does this paragraph look like a safety/moderation tag, or
-    the model narrating its own formatting process, rather than an actual
-    content paragraph?
-    """
     if _METADATA_PATTERNS.match(paragraph):
         return True
     if _META_COMMENTARY_PATTERNS.search(paragraph):
         return True
-    # Real summaries are sentences; metadata tags tend to be short label:value pairs.
+    if _REASONING_STEP_PATTERNS.match(paragraph):
+        return True
     if len(paragraph.split()) <= 6 and ":" in paragraph:
         return True
     return False
@@ -188,20 +179,29 @@ def _extract_candidate_text(body: dict) -> str | None:
         if not isinstance(text, str) or not text.strip():
             continue
 
-        # Strip reasoning — reasoning models think out loud then write
-        # the actual answer as the last paragraph.
-        paragraphs = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
-        if not paragraphs:
-            continue
+        # FIX: some free models output reasoning as single-newline-separated
+        # lines rather than double-newline paragraphs. Split on both and
+        # collect all non-reasoning lines, then take the last clean sentence(s).
+        lines = [ln.strip() for ln in re.split(r"\n+", text.strip()) if ln.strip()]
 
-        # Walk backwards from the end, skipping metadata/safety-tag
-        # paragraphs, to find the last paragraph that looks like real prose.
+        # Filter out lines that are clearly reasoning/meta-commentary
+        clean_lines = [
+            ln for ln in lines
+            if not _looks_like_metadata(ln) and not _REASONING_STEP_PATTERNS.match(ln)
+        ]
+
+        if clean_lines:
+            # Take the last 2 clean lines (the actual bio sentences)
+            candidate = " ".join(clean_lines[-2:])
+            if len(candidate.split()) >= 5:  # must be real prose, not a fragment
+                return candidate
+
+        # Fallback: try paragraph-level walk (original logic)
+        paragraphs = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
         for paragraph in reversed(paragraphs):
             if not _looks_like_metadata(paragraph):
                 return paragraph
 
-        # Every paragraph looked like metadata — nothing usable came back.
-        return None
     return None
 
 
@@ -236,22 +236,17 @@ def _build_fallback_summary(canonical: dict, raw: dict, handle: str = "") -> str
     hn_karma = hn.get("karma")
 
     parts = [f"{name} is a developer"]
-
     if langs:
         parts.append(f"working primarily in {', '.join(langs)}")
     if location:
         parts.append(f"based in {location}")
     if bio:
         parts.append(f"— {bio}")
-
     parts.append(".")
 
     extras = []
-
     if repo_snippets:
-        extras.append(
-            f"Notable repositories include {' and '.join(repo_snippets)}."
-        )
+        extras.append(f"Notable repositories include {' and '.join(repo_snippets)}.")
     if so_tags and so_rep:
         extras.append(
             f"On Stack Overflow they are active in {', '.join(so_tags)} "
@@ -266,44 +261,58 @@ def _build_fallback_summary(canonical: dict, raw: dict, handle: str = "") -> str
 
 
 def _build_prompt(canonical: dict, raw: dict) -> str:
-    gh = raw.get("github", {})
-    so = raw.get("stackexchange", {})
-    dev = raw.get("devto", {})
-    hn = raw.get("hackernews", {})
+    gh = raw.get("github", {}) or {}
+    so = raw.get("stackexchange", {}) or {}
+    dev = raw.get("devto", {}) or {}
+    hn = raw.get("hackernews", {}) or {}
 
-    parts = [
-        f"Name: {canonical.get('display_name', 'Unknown')}",
-        f"Location: {canonical.get('location', 'N/A')}",
-        f"Bio: {canonical.get('bio', 'N/A')}",
-    ]
+    parts = [f"Name: {canonical.get('display_name', 'Unknown')}"]
+
+    if canonical.get("location"):
+        parts.append(f"Location: {canonical['location']}")
+    if canonical.get("bio"):
+        parts.append(f"Bio: {canonical['bio']}")
 
     if gh.get("languages"):
-        parts.append(
-            f"GitHub languages: {', '.join(gh['languages'].keys())}"
-        )
+        parts.append(f"GitHub languages: {', '.join(gh['languages'].keys())}")
     if gh.get("public_repos"):
         parts.append(
-            f"Public repos: {gh['public_repos']}, "
-            f"Followers: {gh.get('followers')}"
+            f"Public repos: {gh['public_repos']}, Followers: {gh.get('followers')}"
         )
+
+    # Top repos by stars — gives the LLM real "notable work" to mention
+    top_repos = sorted(
+        [r for r in (gh.get("repos") or []) if r.get("stars", 0) > 0 and r.get("description")],
+        key=lambda r: -r.get("stars", 0),
+    )[:3]
+    if top_repos:
+        repo_lines = [
+            f"  - {r['name']} ({r['stars']:,}★): {r['description']}"
+            for r in top_repos
+        ]
+        parts.append("Top GitHub repos:\n" + "\n".join(repo_lines))
+
     if so.get("top_tags"):
         parts.append(
-            f"Stack Overflow top tags: {', '.join(so['top_tags'][:5])}, "
-            f"Reputation: {so.get('reputation')}"
+            f"Stack Overflow: tags={', '.join(so['top_tags'][:5])}, "
+            f"reputation={so.get('reputation')}"
         )
     if dev.get("top_tags"):
         parts.append(
-            f"dev.to article tags: {', '.join(list(dev['top_tags'].keys())[:5])}, "
-            f"Articles: {dev.get('article_count')}"
+            f"dev.to: tags={', '.join(list(dev['top_tags'].keys())[:5])}, "
+            f"articles={dev.get('article_count')}"
         )
     if hn.get("karma"):
         parts.append(f"Hacker News karma: {hn['karma']}")
 
     profile_text = "\n".join(parts)
 
+    # FIX: removed "Mention their primary languages and notable work" —
+    # that instruction caused reasoning loops when data was sparse.
+    # The system prompt already defines the format; the user prompt
+    # just supplies the data and a single clear instruction.
     return (
-        "Write a 2-sentence developer profile based only on the data below. "
-        "Mention their primary languages and notable work. "
-        "Do not invent information not present in the data.\n\n"
+        "Write a 2-sentence developer bio using only the facts below. "
+        "Do not invent anything not listed.\n\n"
         f"{profile_text}"
     )

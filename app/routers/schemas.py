@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any
 from pydantic import BaseModel, field_validator, Field
-from typing import Any
+
 
 class ResolveRequest(BaseModel):
     name: str = Field(..., description="Full display name to search for")
@@ -19,7 +19,7 @@ class ResolveRequest(BaseModel):
         }:
             return None
         return v
-    
+
 
 class SourceContribution(BaseModel):
     source: str
@@ -28,6 +28,14 @@ class SourceContribution(BaseModel):
     matched_on: list[str] = Field(default_factory=list)
     explanation: list[str] = Field(default_factory=list)
     confidence_notes: dict[str, Any] = Field(default_factory=dict)
+
+
+class RawFetchedSource(BaseModel):
+    source: str
+    handle: str
+    fetched_at: str
+    confidence: float | None = None
+    linked: bool = False  # True if it made it into source_links
 
 
 class PersonProfile(BaseModel):
@@ -42,6 +50,7 @@ class PersonProfile(BaseModel):
     completeness_score: float | None = None
     provider_statuses: dict[str, str] = Field(default_factory=dict)
     sources: list[SourceContribution]
+    raw_fetched: list[RawFetchedSource] = Field(default_factory=list)
     attributes: dict[str, Any]
     conflicts: list[dict] = Field(default_factory=list)
     last_resolved_at: str | None = None

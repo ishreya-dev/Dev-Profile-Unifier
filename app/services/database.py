@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from app.routers.schemas import PersonProfile, SourceContribution
+from app.routers.schemas import PersonProfile, SourceContribution, RawFetchedSource
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -154,10 +154,14 @@ async def get_profile_by_id(profile_id: str) -> PersonProfile | None:
     links_res = (
         db.table("source_links").select("*").eq("person_id", profile_id).execute()
     )
+    
+    # Build a map of source -> confidence for linked sources
+    linked_map: dict[str, float] = {}
     sources = []
     for l in (links_res.data or []):
         notes = l["confidence_notes"] or {}
         matched_on, explanation = _notes_to_matched(notes)
+        linked_map[l["source"]] = float(l["confidence"])
         sources.append(SourceContribution(
             source=l["source"],
             handle=l["source_handle"],
@@ -174,6 +178,41 @@ async def get_profile_by_id(profile_id: str) -> PersonProfile | None:
     for a in (attrs_res.data or []):
         attributes.setdefault(a["source"], {})[a["attr_key"]] = a["attr_value"]
 
+    # Fetch raw source data for all handles in latest_query
+    latest_query = p.get("latest_query") or {}
+    queried_handles = {
+        source: handle
+        for source, handle in {
+            "github":        latest_query.get("github"),
+            "stackexchange": latest_query.get("stackoverflow"),
+            "devto":         latest_query.get("devto"),
+            "hackernews":    latest_query.get("hackernews"),
+        }.items()
+        if handle
+    }
+
+    raw_fetched = []
+    for source, handle in queried_handles.items():
+        raw_res = (
+            db.table("raw_source_data")
+            .select("source, source_handle, fetched_at")
+            .eq("source", source)
+            .eq("source_handle", handle)
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if raw_res.data:
+            r = raw_res.data[0]
+            is_linked = source in linked_map
+            raw_fetched.append(RawFetchedSource(
+                source=r["source"],
+                handle=r["source_handle"],
+                fetched_at=str(r["fetched_at"]),
+                confidence=linked_map.get(source),
+                linked=is_linked,
+            ))
+
     return PersonProfile(
         id=p["id"],
         display_name=p.get("display_name"),
@@ -188,6 +227,7 @@ async def get_profile_by_id(profile_id: str) -> PersonProfile | None:
         sources=sources,
         attributes=attributes,
         conflicts=p.get("conflicts") or [],
+        raw_fetched=raw_fetched,
         last_resolved_at=str(p["last_resolved_at"]) if p.get("last_resolved_at") else None,
         retry_count=p.get("retry_count", 0),
         last_error=p.get("last_error"),
