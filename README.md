@@ -12,7 +12,7 @@ This is a FastAPI service that aggregates public profile data from four develope
 - Concurrent async fetching from GitHub, Stack Overflow, dev.to, and Hacker News
 - Intelligent entity resolution using handle hints, name matching, email hinting, and cross-platform link-back signals
 - Canonical profile creation with conflict tracking for ambiguous fields
-- Background enrichment via Gemini LLM summary generation
+- Background enrichment via LLM summary generation
 - Comprehensive observability metrics and API call logging
 
 ---
@@ -32,7 +32,7 @@ If new or needs refresh:
   ├─→ Score each source (handle hints, name match, email match, link-back signals)
   ├─→ Merge canonical fields + detect conflicts
   ├─→ Update persons table with resolution status
-  └─→ Generate Gemini summary (enrichment in background)
+  └─→ Generate LLM summary (enrichment in background)
     ↓
 Return profile_id immediately (202 Accepted)
     ↓
@@ -150,7 +150,7 @@ Each provider account is scored 0.0–1.0 based on matching signals:
 - **Python 3.12+**
 - **Supabase account** (free tier works)
 - **GitHub token** (for OAuth access to public user data)
-- **Gemini API key** (optional; fallback summary if missing)
+- **OpenRouter API key** (optional; fallback summary if missing)
 
 ### 1. Clone and Create Virtual Environment
 
@@ -203,7 +203,7 @@ LOG_LEVEL=INFO
 
 **Getting tokens:**
 - **GitHub token**: Create at https://github.com/settings/tokens (needs `public_repo` scope for public data)
-- **Gemini API key**: Get from https://makersuite.google.com/app/apikey
+- **OpenRouter API key**: Get from https://makersuite.google.com/app/apikey
 - **Stack Exchange key**: Create at https://stackapps.com/apps/oauth/register
 
 ### 5. Run Locally
